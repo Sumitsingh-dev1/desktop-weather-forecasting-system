@@ -2,9 +2,44 @@ from dotenv import load_dotenv
 load_dotenv()
 import sys
 import requests
-from PyQt5.QtWidgets import QApplication,QWidget,QLabel,QLineEdit,QPushButton,QVBoxLayout
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication,QWidget,QLabel,QLineEdit,QPushButton,QVBoxLayout,QComboBox
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import os
+
+class WeatherWorker(QThread):
+    result_ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, city, api_key):
+        super().__init__()
+        self.city = city
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            # Geocoding API
+            geo_url = f"http://api.openweathermap.org/geo/1.0/direct?q={self.city},IN&limit=1&appid={self.api_key}"
+            geo_response = requests.get(geo_url, timeout=10)
+            geo_response.raise_for_status()
+            geo_data = geo_response.json()
+
+            if not geo_data:
+                self.error_occurred.emit("Location not found")
+                return
+
+            lat = geo_data[0]["lat"]
+            lon = geo_data[0]["lon"]
+
+            # Weather API
+            weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={self.api_key}&units=metric"
+            weather_response = requests.get(weather_url, timeout=10)
+            weather_response.raise_for_status()
+
+            self.result_ready.emit(weather_response.json())
+
+        except Exception:
+            self.error_occurred.emit("Failed to fetch weather")
 
 class WeatherApp(QWidget):
     def __init__(self):
@@ -14,30 +49,40 @@ class WeatherApp(QWidget):
         self.get_weather_button = QPushButton("Get Weather", self)
         self.temperature_label = QLabel(self)
         self.emoji_label = QLabel(self)
-        self.description_label = QLabel(self) 
+        self.description_label = QLabel(self)
+        self.status_label = QLabel(self)
+        self.history_box = QComboBox(self)
+        self.history_box.setPlaceholderText("Search History")
+        self.search_history = []
         self.initUI()
        
 
     def initUI(self):
-        self.setWindowTitle("Weather App")   
+        self.setWindowTitle("Weather App") 
+        self.history_box.currentTextChanged.connect(self.use_history)  
 
         vbox = QVBoxLayout()
 
 
         vbox.addWidget(self.city_label)
         vbox.addWidget(self.city_input) 
+        vbox.addWidget(self.history_box)
         vbox.addWidget(self.get_weather_button)
         vbox.addWidget(self.temperature_label)
         vbox.addWidget(self.emoji_label)
         vbox.addWidget(self.description_label)
+        vbox.addWidget(self.status_label)
+       
 
         self.setLayout(vbox)
 
-        self.city_label.setAlignment(Qt.AlignCenter)
+        self.city_label.setAlignment(Qt.AlignCenter) 
         self.city_input.setAlignment(Qt.AlignCenter)
         self.temperature_label.setAlignment(Qt.AlignCenter)
         self.emoji_label.setAlignment(Qt.AlignCenter)
         self.description_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        
 
         self.city_label.setObjectName("city_label")
         self.city_input.setObjectName("city_input")
@@ -69,75 +114,71 @@ class WeatherApp(QWidget):
                                """)
         
         self.get_weather_button.clicked.connect(self.get_weather)
+        self.city_input.returnPressed.connect(self.get_weather)
         
+    
     def get_weather(self):
-        api_key =  os.getenv("WEATHER_API_KEY")
-        city = self.city_input.text()
-        url =f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}"
+        city = self.city_input.text().strip()
+        api_key = os.getenv("WEATHER_API_KEY")
 
-        try:
-             response = requests.get(url)
-             response.raise_for_status()
-             data = response.json()
-             if data["cod"] == 200:
-               self.display_weather(data)
-        except requests.exceptions.HTTPError as http_error:
-            match response.status_code:
-                case 400:
-                    self.display_error("Bad request:\nPlase check your input")
-                case 401:
-                    self.display_error("Unauthorized:\nInvalid Api key") 
-                case 403:
-                    self.display_error("Forbidden\nAccess is denied")
-                case 404:
-                    self.display_error("Not found:\nCity not found")   
-                case 500:
-                    self.display_error("Internal server:\nPlase try again later") 
-                case 502:
-                    self.display_error("Bad Gateway:\nInvalid response from server") 
-                case 503:
-                    print("Service unavialable:\nServer is down")
-                case 504:
-                   self.display_error ("Gateway Timeout:\nNo response from server")
-                    
-                case _:
-                    self.display_error(f"Http error occured:\n{http_error}")
-        except requests.exceptions.ConnectionError:
-            self.display_error("Connection Error:\nCheck Your internet connection")
-                        
-        except requests.exceptions.Timeout:
-            self.display_error("Timeout Error:\nThe request timed out")
+        if not city:
+            self.display_error("Please enter a location")
+            return
 
-        
-        except requests.exceptions.TooManyRedirects:
-            self.display_error("TooManyRedirects:\nCheck the url")                          
-        except requests.exceptions.RequestException as req_error:
-            self.display_error(f"Request Error:\n{req_error}")
-                   
+        self.status_label.setText("Fetching weather...")
+        self.get_weather_button.setEnabled(False)
 
-       
-        
+        self.worker = WeatherWorker(city, api_key)
+        self.worker.result_ready.connect(self.on_weather_loaded)
+        self.worker.error_occurred.connect(self.display_error)
+        self.worker.start() 
 
-         
-    def display_error(self,message):
+    def use_history(self, text):
+        if text:
+            self.city_input.setText(text)
+            self.get_weather()    
+
+
+   
+    def on_weather_loaded(self, data):
+    # Re-enable button and clear loading text
+        self.status_label.setText("")
+        self.get_weather_button.setEnabled(True)
+
+        # Get city from input (needed for history)
+        city = self.city_input.text().strip()
+
+        if city and city not in self.search_history:
+            self.search_history.append(city)
+            self.history_box.addItem(city)
+
+        # Show weather result
+        self.display_weather(data)
+
+    def display_error(self, message):
+        self.status_label.setText("")
+        self.get_weather_button.setEnabled(True)
+
         self.temperature_label.setStyleSheet("font-size: 30px;")
-
         self.temperature_label.setText(message)
         self.emoji_label.clear()
-        self.description_label.clear()
+        self.description_label.clear()                 
 
-    def display_weather(self,data):
-        self.temperature_label.setStyleSheet("font-size: 75px;")
-        temperature_k = data["main"]["temp"] 
-        temperature_c = temperature_k - 273.15
-        temperature_f = (temperature_k * 9/5) - 459.67
+    def display_weather(self, data):
+        temperature = data["main"]["temp"]
         weather_id = data["weather"][0]["id"]
-        weather_description = data["weather"][0]["description"]
+        description = data["weather"][0]["description"]
+        location = data["name"]
 
-
-        self.temperature_label.setText(f"{temperature_c:.0f}°C")
+        self.temperature_label.setStyleSheet("font-size: 75px;")
+        self.temperature_label.setText(f"{temperature:.1f}°C")
         self.emoji_label.setText(self.get_weather_emoji(weather_id))
-        self.description_label.setText(weather_description)
+        self.description_label.setText(f"{location} • {description}")
+           
+
+        
+             
+        
     @staticmethod
     def get_weather_emoji(weather_id):  
 
